@@ -656,39 +656,25 @@ class SDVAR(nn.Module):
         print_stats: bool = True
     ) -> torch.Tensor:
         """
-        Speculative decoding with verification for VAR model
-        
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax
-        :param entry_num: how many stages to use draft model for
-        :param sd_mask: which type of masking to use
-        :param similarity_threshold: threshold for accepting draft model predictions
-        :param cosine_sim: whether to use cosine similarity (True) or KL divergence (False)
-        :param print_stats: whether to print acceptance statistics
-        :return: generated image tensor (B, 3, H, W) in [0, 1]
+        Modified version of sdvar_autoregressive_infer_cfg_sd_test3 with verification
         """
-        # Validation of models
+        # Common parameters
         assert self.draft_model.patch_nums == self.target_model.patch_nums
         assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
         self.num_stages_minus_1 = self.draft_model.num_stages_minus_1
     
-        # Set up references
         total_stages = len(self.patch_nums)
         device = torch.device("cuda:0")
+    
         self.vae_proxy = self.target_model.vae_proxy
         self.vae_quant_proxy = self.target_model.vae_quant_proxy
     
-        # Statistics for verification
+        # Stats tracking
         total_tokens = 0
         accepted_tokens = 0
     
-        # Handle random seed
+        # Initialize random generator
         if g_seed is not None:
             self.rng = self.target_model.rng.manual_seed(g_seed)
         else:
@@ -706,26 +692,25 @@ class SDVAR(nn.Module):
                 device=self.target_model.lvl_1L.device
             )
     
-        # Initialize both models
+        # Initialize parameters
         draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
         draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
     
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
     
-        # Draft model tracking
         draft_cur_L = 0
         draft_next_token_map = draft_first_token_map
         draft_token_hub = []
-    
-        # Enable KV caching for both models
+        
+        # Enable KV caching
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(True)
-    
+        
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(True)
     
-        # FIRST PHASE: DRAFT MODEL GENERATION WITH VERIFICATION
+        # DRAFT MODEL PHASE WITH VERIFICATION
         for si, pn in enumerate(self.patch_nums):
             # Skip if beyond entry point
             if si >= entry_num:
@@ -733,112 +718,96 @@ class SDVAR(nn.Module):
     
             ratio = si / self.num_stages_minus_1
             draft_cur_L += pn*pn
-            t = cfg * ratio
-    
-            # 1. Get draft model predictions
-            x_draft = draft_next_token_map
+            
+            # 1. Draft model generation
+            x = draft_next_token_map
             
             for blk in self.draft_model.blocks:
-                x_draft = blk(x=x_draft, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
+                x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
             
-            draft_logits_BlV = self.draft_model.get_logits(x_draft, draft_cond_BD)            
+            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
+            
+            # Apply CFG
+            t = cfg * ratio
             draft_logits_BlV = (1+t)*draft_logits_BlV[:B] - t*draft_logits_BlV[B:]
             draft_probs = torch.softmax(draft_logits_BlV, dim=-1)
+    
+            # 2. Target model verification (run target on same input)
+            # Determine context length
+            context_len = 1  # Start token
+            if si > 0:
+                context_len += sum(self.patch_nums[s]**2 for s in range(si))
             
-            # 2. Get target model predictions for verification
-            # For verification, we need to run the target model on the same prefix
-            # Prepare context for target model
+            # Create target input for verification
             if si == 0:
-                # First step is simple - just the start token
-                x_target = target_first_token_map
+                # First step just needs start token
+                target_x = target_first_token_map
             else:
-                # For subsequent steps, we need all previous tokens that the draft model has generated
-                # This is where things get complicated as we need to align properly
-                
-                # Get all previously predicted tokens from draft_f_hat
+                # Get tokens from previous steps
                 prev_tokens_list = []
                 for prev_si in range(si):
                     prev_pn = self.patch_nums[prev_si]
-                    # This extracts tokens from the current f_hat at the appropriate scale
+                    # Extract tokens from f_hat
                     prev_tokens = self.vae_quant_proxy[0].get_tokens_from_fhat(
                         draft_f_hat, prev_si, prev_pn
                     )
-                    # Reshape to match expected format
                     prev_tokens = prev_tokens.view(B, self.target_model.Cvae, -1).transpose(1, 2)
                     prev_tokens_list.append(prev_tokens)
                 
-                # Now create the full context for the target model
-                if prev_tokens_list:
-                    # Process SOS token
-                    x_target = target_first_token_map.clone()
-                    
-                    # Process previous tokens
-                    prev_tokens = torch.cat(prev_tokens_list, dim=1)
-                    prev_token_embed = self.target_model.word_embed(prev_tokens)
-                    
-                    # Add position embeddings
-                    prev_token_count = sum(self.patch_nums[s]**2 for s in range(si))
-                    pos_embed = target_lvl_pos[:, 1:1+prev_token_count]
-                    prev_token_embed = prev_token_embed + pos_embed
-                    
-                    # Repeat for CFG and concat with SOS
-                    prev_token_embed_2x = prev_token_embed.repeat(2, 1, 1)
-                    x_target = torch.cat([x_target, prev_token_embed_2x], dim=1)
-                else:
-                    # Just use start token if no previous tokens
-                    x_target = target_first_token_map
-            
-            # Apply appropriate masking
-            attn_bias = None
-            if sd_mask != 0:
-                # Calculate the current token count
-                cur_tokens = sum(self.patch_nums[s]**2 for s in range(si+1))
+                # Concatenate all previous tokens
+                prev_tokens = torch.cat(prev_tokens_list, dim=1)
+                # Apply word and position embeddings
+                prev_tokens_embed = self.target_model.word_embed(prev_tokens)
+                prev_pos = 1  # Skip the first position which is for SOS
+                prev_tokens_embed = prev_tokens_embed + target_lvl_pos[:, prev_pos:prev_pos+prev_tokens.size(1)]
                 
-                if sd_mask == 1:
-                    # Type 1: Full block-wise masking for all layers
-                    attn_bias = self.attn_bias_for_sdmasking[:, :, :cur_tokens, :cur_tokens].to(device)
-                elif sd_mask == 2:
-                    # Type 2: Block-wise masking except for current layer
-                    attn_bias = self.attn_bias_for_sdmasking[:, :, :cur_tokens, :cur_tokens].clone().to(device)
-                    prev_tokens = sum(self.patch_nums[s]**2 for s in range(si))
-                    attn_bias[:, :, prev_tokens:cur_tokens, :] = 0.0
-                elif sd_mask == 3:
-                    # Type 3: Standard causal masking
-                    attn_bias = self.target_model.attn_bias_for_masking[:, :, :cur_tokens, :cur_tokens]
+                # Create target input with SOS and previous tokens
+                # IMPORTANT: First create B-sized tensors, then repeat to 2B
+                target_x_first_half = torch.cat([
+                    target_first_token_map[:B], 
+                    prev_tokens_embed
+                ], dim=1)
+                
+                # Now repeat to get 2B batch size for CFG
+                target_x = torch.cat([target_x_first_half, target_x_first_half], dim=0)
             
-            # Run target model for verification
+            # Apply masking if needed
+            attn_bias = None
+            if sd_mask == 1:
+                # Full block-wise masking
+                cur_tokens = 1 + (0 if si == 0 else sum(self.patch_nums[s]**2 for s in range(si)))
+                attn_bias = self.attn_bias_for_sdmasking[:, :, :cur_tokens, :cur_tokens].to(device)
+            elif sd_mask == 2:
+                # Block-wise masking except current
+                cur_tokens = 1 + (0 if si == 0 else sum(self.patch_nums[s]**2 for s in range(si)))
+                attn_bias = self.attn_bias_for_sdmasking[:, :, :cur_tokens, :cur_tokens].clone().to(device)
+                prev_tokens = 1  # SOS token
+                attn_bias[:, :, prev_tokens:cur_tokens, :] = 0.0
+            elif sd_mask == 3:
+                # Standard causal masking
+                cur_tokens = 1 + (0 if si == 0 else sum(self.patch_nums[s]**2 for s in range(si)))
+                attn_bias = self.target_model.attn_bias_for_masking[:, :, :cur_tokens, :cur_tokens]
+            
+            # Process with target model
             for blk in self.target_model.blocks:
-                x_target = blk(x=x_target, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
+                target_x = blk(x=target_x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
             
-            # Get target predictions for current tokens only
-            if si > 0:
-                # Extract the relevant part of the output for the current step
-                prev_tokens = sum(self.patch_nums[s]**2 for s in range(si))
-                cur_tokens = sum(self.patch_nums[s]**2 for s in range(si+1))
-                x_target_current = x_target[:, prev_tokens:cur_tokens]
-            else:
-                # For first step, we're predicting from the start token
-                x_target_current = x_target
-            
-            target_logits_BlV = self.target_model.get_logits(x_target_current, target_cond_BD)
-            target_logits_BlV = (1+t)*target_logits_BlV[:B] - t*target_logits_BlV[B:]
+            # Get logits for verification
+            target_logits_BlV = self.target_model.get_logits(target_x, target_cond_BD)
+            target_logits_BlV = (1+t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
             target_probs = torch.softmax(target_logits_BlV, dim=-1)
             
-            # 3. Compare distributions and create acceptance mask
+            # 3. Calculate similarity and create acceptance mask
             if cosine_sim:
-                # Cosine similarity (dot product of normalized vectors)
-                norm_draft = torch.norm(draft_probs, dim=-1, keepdim=True)
-                norm_target = torch.norm(target_probs, dim=-1, keepdim=True)
-                similarities = torch.sum(
-                    (draft_probs / (norm_draft + 1e-8)) * (target_probs / (norm_target + 1e-8)), 
-                    dim=-1
-                )
+                # Cosine similarity
+                draft_norm = torch.norm(draft_probs, dim=-1, keepdim=True)
+                target_norm = torch.norm(target_probs, dim=-1, keepdim=True)
+                draft_normalized = draft_probs / (draft_norm + 1e-6)
+                target_normalized = target_probs / (target_norm + 1e-6)
+                similarities = torch.sum(draft_normalized * target_normalized, dim=-1)
             else:
-                # KL divergence (converted to similarity)
-                kl_div = torch.sum(
-                    target_probs * torch.log((target_probs + 1e-10) / (draft_probs + 1e-10)), 
-                    dim=-1
-                )
+                # KL divergence
+                kl_div = torch.sum(target_probs * torch.log((target_probs + 1e-6) / (draft_probs + 1e-6) + 1e-6), dim=-1)
                 similarities = torch.exp(-kl_div)
             
             # Create acceptance mask
@@ -857,10 +826,10 @@ class SDVAR(nn.Module):
                 target_logits_BlV, rng=self.rng, top_k=top_k, top_p=top_p, num_samples=1
             )[:, :, 0]
             
-            # 5. Merge predictions based on acceptance mask
+            # Merge based on acceptance
             final_idx_Bl = torch.where(acceptance_mask, draft_idx_Bl, target_idx_Bl)
             
-            # 6. Process tokens and update f_hat
+            # 5. Process tokens
             if not more_smooth:
                 h_BChw = self.vae_quant_proxy[0].embedding(final_idx_Bl)
             else:
@@ -870,104 +839,121 @@ class SDVAR(nn.Module):
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
             h_BChw = h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+            
+            # Update f_hat
             draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, total_stages, draft_f_hat, h_BChw
             )
             
-            # 7. Prepare for next step if not the last
+            # 6. Prepare for next step
             if si != self.num_stages_minus_1:
                 next_pn = self.patch_nums[si+1]
                 draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
                 draft_token_hub.append(draft_next_token_map)
-                draft_next_token_map = self.draft_model.word_embed(draft_next_token_map) + draft_lvl_pos[:, draft_cur_L:draft_cur_L + next_pn*next_pn]
-                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
+    
+                # IMPORTANT: Fix for dimension issue - create a fresh 2*B sized tensor
+                # First prepare B-sized tensor
+                draft_token_embed = self.draft_model.word_embed(draft_next_token_map)
+                draft_pos_embed = draft_lvl_pos[:, draft_cur_L:draft_cur_L + next_pn*next_pn]
+                draft_token_with_pos = draft_token_embed + draft_pos_embed
+                
+                # Then explicitly create 2*B sized tensor by duplication
+                draft_next_token_map = torch.cat([draft_token_with_pos, draft_token_with_pos], dim=0)
         
-        # If we finished all scales with the draft model
-        if si == self.num_stages_minus_1 and si < entry_num:
+        # If all stages completed with draft model
+        if entry_num > self.num_stages_minus_1:
+            # Clean up
             for blk in self.draft_model.blocks:
                 blk.attn.kv_caching(False)
             for blk in self.target_model.blocks:
                 blk.attn.kv_caching(False)
             
+            # Print stats
             if print_stats and total_tokens > 0:
                 print(f"Acceptance rate: {accepted_tokens / total_tokens:.4f} ({accepted_tokens}/{total_tokens})")
-                
+            
             return self.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)
         
-        # SECOND PHASE: TARGET MODEL CONTINUATION
+        # PHASE 2: TARGET MODEL CONTINUATION
         
-        # Process draft tokens for target model input
+        # Prepare draft tokens for target model
         if len(draft_token_hub) > 0:
             draft_token_hub = torch.cat(draft_token_hub, dim=1)
         
-        # Clean up draft model resources
+        # Clean up draft model
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(False)
         
-        # Reference points for the target model
+        # Reference points
         start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
         exit_points = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
+        pindex = exit_points[entry_num]
+        sindex = start_points[entry_num]
         
-        # Set current scale for target model continuation
         target_cur_L = 0
-        target_f_hat = draft_f_hat.clone()  # Continue from draft model's f_hat
+        target_f_hat = draft_f_hat.clone()  # Continue from verified f_hat
         
-        # Prepare tokens for target model continuation
+        # Prepare target model input
         if len(draft_token_hub) > 0:
-            # Get position for entry_num
-            pindex = sum(self.patch_nums[s]**2 for s in range(entry_num))
+            # Use draft tokens for context
+            target_token_embed = self.target_model.word_embed(draft_token_hub)
+            target_pos_embed = target_lvl_pos[:, 1:1+draft_token_hub.size(1)]
+            target_token_with_pos = target_token_embed + target_pos_embed
             
-            # Process draft tokens
-            target_next_token_map = self.target_model.word_embed(draft_token_hub)
-            
-            # Add position embeddings - avoid dimension mismatch here
-            positions = target_lvl_pos[:, 1:1+draft_token_hub.size(1)]
-            target_next_token_map = target_next_token_map + positions
-            
-            # Double for CFG and concatenate with start tokens
-            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
-            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
+            # Create 2*B batch for CFG
+            target_token_with_pos_2B = torch.cat([target_token_with_pos, target_token_with_pos], dim=0)
+            target_next_token_map = torch.cat([target_first_token_map, target_token_with_pos_2B], dim=1)
         else:
             target_next_token_map = target_first_token_map
         
-        # Continue generation with target model
+        # TARGET MODEL GENERATION
         for si, pn in enumerate(self.patch_nums):
             ratio = si / self.num_stages_minus_1
             target_cur_L += pn*pn
             t = cfg * ratio
             
-            # Skip already generated scales
+            # Skip scales already handled by draft model
             if si < entry_num:
                 continue
             
-            # Set up appropriate masking
-            pindex = sum(self.patch_nums[s]**2 for s in range(si+1))
-            sindex = sum(self.patch_nums[s]**2 for s in range(si)) 
-            
-            attn_bias = None
-            if sd_mask == 1:
-                # Full block-wise masking
-                attn_bias = self.attn_bias_for_sdmasking[:, :, :pindex, :pindex].to(device)
-            elif sd_mask == 2:
-                # Block-wise masking except current layer
-                attn_bias = self.attn_bias_for_sdmasking[:, :, :pindex, :pindex].clone().to(device)
-                attn_bias[:, :, sindex:pindex, :] = 0.0
-                attn_bias = attn_bias.to(device)
-            elif sd_mask == 3:
-                # Standard causal masking
-                attn_bias = self.target_model.attn_bias_for_masking[:, :, :pindex, :pindex]
-            
-            # Process with target model
-            x = target_next_token_map
-            
-            for b in self.target_model.blocks:
-                x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
-            
-            # Get logits for current tokens
-            if si == entry_num:
-                x_current = x[:, sindex:pindex]
-                target_logits_BlV = self.target_model.get_logits(x_current, target_cond_BD)
+            # Apply masking
+            if sd_mask != 0:
+                if sd_mask == 1:
+                    # Full block-wise masking
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].to(device)
+                elif sd_mask == 2:
+                    # Block-wise masking except current
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone().to(device)
+                    attn_bias[:, :, sindex:pindex, :] = 0.0
+                    attn_bias = attn_bias.to(device)
+                elif sd_mask == 3:
+                    # Standard causal masking
+                    attn_bias = self.target_model.attn_bias_for_masking[:, :, 0:pindex, 0:pindex]
+                
+                x = target_next_token_map
+                
+                if si == entry_num:
+                    for b in self.target_model.blocks:
+                        x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
+                else:
+                    for b in self.target_model.blocks:
+                        x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+                
+                if si == entry_num:
+                    x = target_next_token_map[:, sindex:pindex]
+                    target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+                else:
+                    target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
             else:
+                # No masking
+                if si == entry_num:
+                    x = target_next_token_map[:, sindex:pindex]
+                else:
+                    x = target_next_token_map
+                    
+                for b in self.target_model.blocks:
+                    x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+                    
                 target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
             
             # Apply CFG
@@ -988,7 +974,7 @@ class SDVAR(nn.Module):
                     dim=-1, rng=self.rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            # Reshape and update f_hat
+            # Update f_hat
             target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
             target_f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, len(self.patch_nums), target_f_hat, target_h_BChw
@@ -999,22 +985,22 @@ class SDVAR(nn.Module):
                 next_pn = self.patch_nums[si+1]
                 next_token_map = next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
                 
-                # Get position for next tokens
-                next_positions = target_lvl_pos[:, target_cur_L:target_cur_L + next_pn*next_pn]
+                # IMPORTANT: Prepare target tokens for next scale properly
+                # First get B-sized tokens
+                next_token_embed = self.target_model.word_embed(next_token_map)
+                next_pos_embed = target_lvl_pos[:, target_cur_L:target_cur_L + next_pn*next_pn]
+                next_token_with_pos = next_token_embed + next_pos_embed
                 
-                # Apply embeddings
-                target_next_token_map = self.target_model.word_embed(next_token_map) + next_positions
-                
-                # Double for CFG
-                target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+                # Then explicitly create 2*B batch
+                target_next_token_map = torch.cat([next_token_with_pos, next_token_with_pos], dim=0)
         
         # Clean up and return final image
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(False)
         
+        # Print statistics
         if print_stats and total_tokens > 0:
             print(f"Acceptance rate: {accepted_tokens / total_tokens:.4f} ({accepted_tokens}/{total_tokens})")
         
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
-    
     
