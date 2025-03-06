@@ -677,12 +677,12 @@ class SDVAR(nn.Module):
         assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
         self.num_stages_minus_1 = self.draft_model.num_stages_minus_1
-
+    
         total_stages = len(self.patch_nums)
-
+    
         self.vae_proxy = self.target_model.vae_proxy
         self.vae_quant_proxy = self.target_model.vae_quant_proxy
-
+    
         if g_seed is not None:
             self.rng = self.target_model.rng.manual_seed(g_seed)
         else:
@@ -696,7 +696,7 @@ class SDVAR(nn.Module):
         # Track acceptance statistics
         total_tokens = 0
         accepted_tokens = 0
-
+    
         # Handle label input
         if label_B is None:
             label_B = torch.multinomial(
@@ -708,14 +708,14 @@ class SDVAR(nn.Module):
                 fill_value=self.target_model.num_classes if label_B < 0 else label_B,
                 device=device
             )
-
+    
         # Initialize both models
         draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
         draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
-
+    
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
-
+    
         # Set up cache for tokens
         draft_cur_L = 0
         draft_next_token_map = draft_first_token_map
@@ -880,7 +880,7 @@ class SDVAR(nn.Module):
                     target_next_token_map = target_f_hat.new_zeros(2*B, cur_L + next_pn**2, self.target_model.C)
                     
                     # Add start token
-                    target_next_token_map[:B, :self.target_model.first_l] = target_sos.unsqueeze(1).expand(B, self.target_model.first_l, -1) + target_pos_start.expand(B, self.target_model.first_l, -1)
+                    target_next_token_map[:B, :self.target_model.first_l] = target_sos.unsqueeze(1).expand(B, self.target_model.first_l, -1) + self.target_model.pos_start.expand(B, self.target_model.first_l, -1)
                     target_next_token_map[B:, :self.target_model.first_l] = target_next_token_map[:B, :self.target_model.first_l]
                     
                     # Add all previous stage tokens
