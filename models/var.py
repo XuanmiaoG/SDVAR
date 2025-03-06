@@ -965,5 +965,5 @@ class SDVAR(nn.Module):
         if print_stats and total_tokens > 0:
             print(f"Acceptance rate: {accepted_tokens / total_tokens:.4f} ({accepted_tokens}/{total_tokens})")
         
-        # Convert to image
+        # Convert to image gaidong1
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
