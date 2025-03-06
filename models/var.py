@@ -880,14 +880,8 @@ class SDVAR(nn.Module):
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
     
         target_cur_L = 0
-        # Get the shape and device information from draft_f_hat
-        shape = list(draft_f_hat.shape)
-        shape[0] = B  # Ensure the first dimension is B
-        device = draft_f_hat.device
-        
-        # Create a new tensor and copy data (only for batch size B)
-        target_f_hat = torch.zeros(shape, dtype=draft_f_hat.dtype, device=device)
-        target_f_hat.copy_(draft_f_hat[:B])  # Copy only the first B samples
+        target_f_hat = target_sos.new_zeros(B, self.target_model.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+
     
         # 如果draft_token_hub不为0
         if not len(draft_token_hub) == 0:
