@@ -640,7 +640,7 @@ class SDVAR(nn.Module):
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
         
     @torch.no_grad()
-    def sdvar_autoregressive_infer_cfg_with_verification(
+    def sdvar_autoregressive_infer_verified(
         self,
         B: int,
         label_B: Optional[Union[int, torch.LongTensor]],
@@ -656,16 +656,16 @@ class SDVAR(nn.Module):
         print_stats: bool = True
     ) -> torch.Tensor:
         """
-        只在test3的基础上添加验证逻辑
-        :param similarity_threshold: 相似度阈值，高于此值的token会被接受
-        :param cosine_sim: 是否使用余弦相似度（True）或KL散度（False）
-        :param print_stats: 是否打印接受率统计
+        Adds verification to the draft phase of sdvar_autoregressive_infer_cfg_sd_test3
+        :param similarity_threshold: Similarity threshold for accepting draft predictions
+        :param cosine_sim: Whether to use cosine similarity (True) or KL divergence (False)
+        :param print_stats: Whether to print acceptance statistics
         """
-        # 验证统计
+        # Statistics for verification
         total_tokens = 0
         accepted_tokens = 0
         
-        ###### 通用参数参数
+        # Common parameters (same as original function)
         assert self.draft_model.patch_nums == self.target_model.patch_nums
         assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
@@ -681,7 +681,6 @@ class SDVAR(nn.Module):
         else:
             self.rng = None
         
-    
         if label_B is None:
             label_B = torch.multinomial(
                 self.target_model.uniform_prob, num_samples=B, replacement=True, generator=self.rng
@@ -693,43 +692,44 @@ class SDVAR(nn.Module):
                 device=self.target_model.lvl_1L.device
             )
     
+        # Initialize draft model
         draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
         draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
     
-        # 初始化target模型用于验证
-        target_sos, target_cond_BD, target_cond_BD_or_gss, \
-        target_lvl_pos, target_first_token_map, _ = self.init_param(self.target_model, B, label_B)
+        # Initialize target model (just for verification, will be discarded later)
+        verification_target_sos, verification_target_cond_BD, verification_target_cond_BD_or_gss, \
+        verification_target_lvl_pos, verification_target_first_token_map, _ = self.init_param(self.target_model, B, label_B)
     
         draft_cur_L = 0
         draft_next_token_map = draft_first_token_map
         draft_token_hub = []
         
-        # 为draft和target模型启用KV缓存
+        # Enable KV caching for both models
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(True)
         
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(True)
     
+        # DRAFT MODEL GENERATION WITH VERIFICATION
         for si, pn in enumerate(self.patch_nums):
-            
-            # 生成0-entry_num-1
+            # Skip if beyond entry point
             if si >= entry_num:
                 break
     
             ratio = si / self.num_stages_minus_1
             draft_cur_L += pn*pn
-            x = draft_next_token_map
             
-            # 运行draft模型
+            # 1. DRAFT MODEL PREDICTION
+            x = draft_next_token_map
             for blk in self.draft_model.blocks:
                 x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
-            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)            
             
+            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
             t = cfg * ratio
             draft_logits_BlV = (1+t)*draft_logits_BlV[:B] - t*draft_logits_BlV[B:]
             
-            # 计算draft模型预测概率并采样token
+            # Calculate draft probabilities and sample tokens
             draft_probs = torch.softmax(draft_logits_BlV, dim=-1)
             draft_idx_Bl = sample_with_top_k_top_p_(
                 draft_logits_BlV,
@@ -739,18 +739,17 @@ class SDVAR(nn.Module):
                 num_samples=1
             )[:, :, 0]
     
-            # ===== 添加的验证逻辑 =====
-            # 创建target模型的输入（与draft模型相同的上下文）
+            # 2. TARGET MODEL VERIFICATION
+            # Create target model input with the same context as the draft model
             if si == 0:
-                # 第一个尺度只需要起始token
-                target_input = target_first_token_map
+                # For the first scale, just use start token
+                verification_input = verification_target_first_token_map
             else:
-                # 对于后续尺度，需要包含所有之前的token
-                # 从draft_f_hat中提取之前的token
+                # For subsequent scales, need to include all previous tokens
                 prev_tokens_list = []
                 for prev_si in range(si):
                     prev_pn = self.patch_nums[prev_si]
-                    # 从当前的f_hat中提取token
+                    # Extract tokens from draft_f_hat
                     prev_tokens = self.vae_quant_proxy[0].get_tokens_from_fhat(
                         draft_f_hat, prev_si, prev_pn
                     )
@@ -758,76 +757,75 @@ class SDVAR(nn.Module):
                     prev_tokens_list.append(prev_tokens)
                 
                 if prev_tokens_list:
-                    # 将所有之前的token合并并添加嵌入
+                    # Combine previous tokens with embeddings
                     prev_tokens = torch.cat(prev_tokens_list, dim=1)
                     prev_tokens_embed = self.target_model.word_embed(prev_tokens)
                     
-                    # 添加位置嵌入
-                    pos_offset = 1  # 跳过位置0（SOS）
-                    pos_embeddings = target_lvl_pos[:, pos_offset:pos_offset+prev_tokens.size(1)]
+                    # Add position embeddings
+                    pos_offset = 1  # Skip position 0 for SOS
+                    pos_embeddings = verification_target_lvl_pos[:, pos_offset:pos_offset+prev_tokens.size(1)]
                     prev_tokens_embed = prev_tokens_embed + pos_embeddings
                     
-                    # 构建完整输入（起始token + 之前的token）
-                    target_input_B = torch.cat([
-                        target_first_token_map[:B], 
+                    # Combine with start token
+                    verification_input_B = torch.cat([
+                        verification_target_first_token_map[:B], 
                         prev_tokens_embed
                     ], dim=1)
                     
-                    # 复制以匹配CFG需要的批次大小
-                    target_input = torch.cat([target_input_B, target_input_B], dim=0)
+                    # Duplicate for CFG
+                    verification_input = torch.cat([verification_input_B, verification_input_B], dim=0)
                 else:
-                    target_input = target_first_token_map
+                    verification_input = verification_target_first_token_map
             
-            # 运行target模型
-            y = target_input
+            # Run target model for verification
+            y = verification_input
             for blk in self.target_model.blocks:
-                y = blk(x=y, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+                y = blk(x=y, cond_BD=verification_target_cond_BD_or_gss, attn_bias=None)
             
-            # 获取target模型当前尺度的预测
-            target_logits_BlV = self.target_model.get_logits(y, target_cond_BD)
-            target_logits_BlV = (1+t)*target_logits_BlV[:B] - t*target_logits_BlV[B:]
-            target_probs = torch.softmax(target_logits_BlV, dim=-1)
+            # Get target model predictions
+            verification_logits_BlV = self.target_model.get_logits(y, verification_target_cond_BD)
+            verification_logits_BlV = (1+t)*verification_logits_BlV[:B] - t*verification_logits_BlV[B:]
+            verification_probs = torch.softmax(verification_logits_BlV, dim=-1)
             
-            # 计算相似度并决定是否接受
+            # 3. Calculate similarity and create acceptance mask
             if cosine_sim:
-                # 余弦相似度
+                # Cosine similarity
                 draft_norm = torch.norm(draft_probs, dim=-1, keepdim=True)
-                target_norm = torch.norm(target_probs, dim=-1, keepdim=True)
+                verification_norm = torch.norm(verification_probs, dim=-1, keepdim=True)
                 similarities = torch.sum(
-                    (draft_probs / (draft_norm + 1e-8)) * (target_probs / (target_norm + 1e-8)),
+                    (draft_probs / (draft_norm + 1e-8)) * (verification_probs / (verification_norm + 1e-8)),
                     dim=-1
                 )
             else:
-                # KL散度转换为相似度
+                # KL divergence
                 kl_div = torch.sum(
-                    target_probs * torch.log((target_probs + 1e-8) / (draft_probs + 1e-8) + 1e-8),
+                    verification_probs * torch.log(verification_probs / (draft_probs + 1e-8) + 1e-8),
                     dim=-1
                 )
                 similarities = torch.exp(-kl_div)
             
-            # 创建接受掩码
+            # Create acceptance mask
             acceptance_mask = similarities >= similarity_threshold
             
-            # 更新统计信息
+            # Update statistics
             total_tokens += acceptance_mask.numel()
             accepted_tokens += acceptance_mask.sum().item()
             
-            # 采样target模型token（用于被拒绝的token）
-            target_idx_Bl = sample_with_top_k_top_p_(
-                target_logits_BlV,
+            # Sample target tokens for rejected predictions
+            verification_idx_Bl = sample_with_top_k_top_p_(
+                verification_logits_BlV,
                 rng=self.rng,
                 top_k=top_k,
                 top_p=top_p,
                 num_samples=1
             )[:, :, 0]
             
-            # 根据接受掩码合并结果
-            final_idx_Bl = torch.where(acceptance_mask, draft_idx_Bl, target_idx_Bl)
-            # ===== 验证逻辑结束 =====
-    
-            # 继续原有流程，但使用验证后的token
+            # Combine based on acceptance mask
+            final_idx_Bl = torch.where(acceptance_mask, draft_idx_Bl, verification_idx_Bl)
+            
+            # Continue with original flow using verified tokens
             if not more_smooth:
-                draft_h_BChw = self.vae_quant_proxy[0].embedding(final_idx_Bl)  # 使用验证后的token
+                draft_h_BChw = self.vae_quant_proxy[0].embedding(final_idx_Bl)
             else:
                 draft_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
                 draft_h_BChw = gumbel_softmax_with_rng(
@@ -851,38 +849,46 @@ class SDVAR(nn.Module):
                 draft_next_token_map = draft_next_token_map.repeat(2,1,1)
     
             if si == self.num_stages_minus_1:
+                # If we've completed the last scale with draft model
+                # Clean up KV caches
                 for blk in self.draft_model.blocks:
                     blk.attn.kv_caching(False)
                 for blk in self.target_model.blocks:
                     blk.attn.kv_caching(False)
                     
-                # 打印验证统计
+                # Print verification statistics
                 if print_stats and total_tokens > 0:
                     print(f"Acceptance rate: {accepted_tokens / total_tokens:.4f} ({accepted_tokens}/{total_tokens})")
                     
                 return self.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)
     
-        # draft模型生成完毕  
+        # Finished draft model generation
         if len(draft_token_hub) != 0:   
-            draft_token_hub = torch.cat(draft_token_hub, dim = 1)      
+            draft_token_hub = torch.cat(draft_token_hub, dim=1)
+        
+        # Clean up KV caches
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(False)
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(False)
         
-        ###### target模型接受draft模型生成的内容然后生成最后一层的内容
+        # ===== TARGET MODEL CONTINUATION (same as original function) =====
+        # This part is copied directly from sdvar_autoregressive_infer_cfg_sd_test3
+        # with no modifications to ensure compatibility
+        
         start_points = [0,1,5,14,30,55,91,155,255,424]
         exit_points = [1,5,14,30,55,91,155,255,424,680]
         pindex = exit_points[entry_num]
         sindex = start_points[entry_num]
         device = torch.device("cuda:0")
     
+        # Reinitialize target model for generation phase
+        # This ensures we're starting fresh with no interference from verification
+        target_sos, target_cond_BD, target_cond_BD_or_gss, \
+        target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
     
-        # target_sos, target_cond_BD, target_cond_BD_or_gss, \
-        # target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
-    
-        # target_cur_L = 0
-        # target_f_hat = draft_f_hat
+        target_cur_L = 0
+        target_f_hat = draft_f_hat
     
         # 如果draft_token_hub不为0
         if not len(draft_token_hub) == 0:
@@ -927,7 +933,6 @@ class SDVAR(nn.Module):
                     attn_bias = self.target_model.attn_bias_for_masking[:,:,0:pindex,0:pindex]
     
                 x = target_next_token_map
-                
                 # 这里我们暂时不检测也不用attn_bias，因为我们当前只截取了进入层的
                 if si == entry_num:
                     for b in self.target_model.blocks:
@@ -992,7 +997,7 @@ class SDVAR(nn.Module):
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(False)   
         
-        # 打印验证统计
+        # Print final verification statistics
         if print_stats and total_tokens > 0:
             print(f"Acceptance rate: {accepted_tokens / total_tokens:.4f} ({accepted_tokens}/{total_tokens})")
                         
