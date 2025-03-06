@@ -164,6 +164,37 @@ class VectorQuantizer2(nn.Module):
             f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw))
         
         return f_hat_or_idx_Bl
+        
+    # Add this method to the VectorQuantizer2 class
+    def get_tokens_from_fhat(self, f_hat, si, pn):
+        """
+        Extract tokens from f_hat at a specific scale.
+        
+        Parameters:
+        - f_hat: The feature representation
+        - si: Scale index
+        - pn: Patch number at that scale
+        
+        Returns:
+        - Tokens for the given scale
+        """
+        # This is a simplified implementation - you might need to adjust based on your actual logic
+        B, C, H, W = f_hat.shape
+        
+        # Calculate the starting position for this scale
+        # This assumes f_hat contains information for all scales
+        scale_h = H // pn
+        scale_w = W // pn
+        
+        # Extract the relevant feature map for this scale
+        # Using interpolation to get the right size
+        import torch.nn.functional as F
+        scale_f = F.interpolate(f_hat, size=(pn, pn), mode='bilinear', align_corners=False)
+        
+        # Quantize the feature map to get tokens
+        tokens = self.get_codebook_indices(scale_f)
+        
+        return tokens
     
     # ===================== idxBl_to_var_input: only used in VAR training, for getting teacher-forcing input =====================
     def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
