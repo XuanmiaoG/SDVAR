@@ -881,8 +881,8 @@ class SDVAR(nn.Module):
         # target_sos, target_cond_BD, target_cond_BD_or_gss, \
         # target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
     
-        target_cur_L = 0
-        target_f_hat = draft_f_hat
+        # target_cur_L = 0
+        # target_f_hat = draft_f_hat
     
         # 如果draft_token_hub不为0
         if not len(draft_token_hub) == 0:
