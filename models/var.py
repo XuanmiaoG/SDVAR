@@ -880,7 +880,9 @@ class SDVAR(nn.Module):
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
     
         target_cur_L = 0
-        target_f_hat = draft_f_hat
+        target_f_hat = draft_f_hat.clone()  # Make sure it's a new tensor
+        if target_f_hat.size(0) != B:  # If batch dimensions don't match
+            target_f_hat = target_f_hat[:B]  # Take only the first B examples
     
         # 如果draft_token_hub不为0
         if not len(draft_token_hub) == 0:
