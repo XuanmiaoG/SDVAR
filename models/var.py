@@ -1226,7 +1226,8 @@ class SDVAR(nn.Module):
             
             # 推测解码验证步骤 - 只在entry_num阶段执行
             if si == entry_num and len(draft_idx_hub) > 0:
-                draft_tokens = draft_idx_hub[0]  # 获取要验证的草稿tokens
+                #draft_tokens = draft_idx_hub[0]  # 获取要验证的草稿tokens
+                draft_tokens = draft_idx_hub[-1]  # 使用最新保存的draft tokens
                 
                 print(f"验证阶段 {entry_num}:")
                 print(f"目标logits形状: {target_logits_BlV.shape}")
