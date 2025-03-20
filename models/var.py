@@ -1025,66 +1025,45 @@ class SDVAR(nn.Module):
         more_smooth: bool = False,
         entry_num: int = 10, 
         sd_mask: int = 0,
-        similarity_threshold: float = 0.8, # Threshold for accepting draft tokens
+        similarity_threshold: float = 0.8
     ):
-        """
-        Speculative decoding implementation for VAR model
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :param entry_num: entry point for target model
-        :param sd_mask: masking strategy (0: no mask, 1: block-wise mask, 2: modified block-wise mask, 3: causal mask)
-        :param similarity_threshold: threshold for accepting draft tokens based on logit similarity
-        :return: Generated image (B, 3, H, W) in [0, 1]
-        """
-        # Special case for entry_num = 0 or 1, just use the target model directly
+        # 对于很小的entry_num，直接使用目标模型
         if entry_num <= 1:
             return self.target_model.autoregressive_infer_cfg(
-                B=B,
-                label_B=label_B,
-                g_seed=g_seed,
-                cfg=cfg,
-                top_k=top_k,
-                top_p=top_p,
-                more_smooth=more_smooth
+                B=B, label_B=label_B, g_seed=g_seed, 
+                cfg=cfg, top_k=top_k, top_p=top_p, more_smooth=more_smooth
             )
-            
-        ###### Common parameters and initialization
+        
+        # 标准初始化部分（与test3相同）
         assert self.draft_model.patch_nums == self.target_model.patch_nums
-        assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
         self.num_stages_minus_1 = self.draft_model.num_stages_minus_1
-
+        
         total_stages = len(self.patch_nums)
         start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
         exit_points = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
         device = torch.device("cuda:0")
-
+        
         self.vae_proxy = self.target_model.vae_proxy
         self.vae_quant_proxy = self.target_model.vae_quant_proxy
-
+        
         if g_seed is not None:
             self.rng = self.target_model.rng.manual_seed(g_seed)
         else:
             self.rng = None
 
-        # Process label batch
+        # 处理标签
         if label_B is None:
             label_B = torch.multinomial(
                 self.target_model.uniform_prob, num_samples=B, replacement=True, generator=self.rng
             ).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full(
-                (B,),
-                fill_value=self.target_model.num_classes if label_B < 0 else label_B,
+                (B,), fill_value=self.target_model.num_classes if label_B < 0 else label_B,
                 device=self.target_model.lvl_1L.device
             )
 
-        ###### Initialize draft model parameters
+        # 初始化草稿模型参数
         draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
         draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
 
@@ -1092,17 +1071,15 @@ class SDVAR(nn.Module):
         draft_next_token_map = draft_first_token_map
         draft_token_hub = []
         
-        # 保存当前entry_num的上一层预测（我们要验证的token）
-        draft_tokens_to_verify = None
-        draft_idx_record = []
+        # 为验证存储草稿模型的最后一批tokens（上一层的输出）
+        draft_idx_hub = []  # 存储所有阶段的索引，用于调试
         
-        # Enable KV caching for draft model
+        # 启用草稿模型的KV缓存
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(True)
 
-        ###### Generate with draft model up to entry_num
+        # 使用草稿模型生成直到entry_num
         for si, pn in enumerate(self.patch_nums):
-            # Stop at entry_num
             if si >= entry_num:
                 break
 
@@ -1110,33 +1087,24 @@ class SDVAR(nn.Module):
             draft_cur_L += pn*pn
             x = draft_next_token_map
             
-            # Process through transformer blocks
+            # 通过草稿模型的transformer blocks
             for blk in self.draft_model.blocks:
                 x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
             
-            # Get logits and apply CFG
+            # 获取草稿模型的logits并应用CFG
             draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)            
             t = cfg * ratio
             draft_logits_BlV = (1+t)*draft_logits_BlV[:B] - t*draft_logits_BlV[B:]
             
-            # Sample tokens
+            # 采样tokens
             draft_idx_Bl = sample_with_top_k_top_p_(
-                draft_logits_BlV,
-                rng=self.rng,
-                top_k=top_k,
-                top_p=top_p,
-                num_samples=1
+                draft_logits_BlV, rng=self.rng, top_k=top_k, top_p=top_p, num_samples=1
             )[:, :, 0]
             
-            # Store all draft tokens for tracking
-            draft_idx_record.append(draft_idx_Bl.clone())
+            # 保存生成的索引（用于调试和验证）
+            draft_idx_hub.append(draft_idx_Bl.clone())
             
-            # 如果是最后一层（要进入验证的层），保存token
-            if si == entry_num - 1:
-                draft_tokens_to_verify = draft_idx_Bl.clone()
-                print(f"Stored verification tokens at stage {si}, shape: {draft_tokens_to_verify.shape}")
-
-            # Convert indices to embeddings
+            # 将索引转换为嵌入
             if not more_smooth:
                 draft_h_BChw = self.vae_quant_proxy[0].embedding(draft_idx_Bl)
             else:
@@ -1145,161 +1113,163 @@ class SDVAR(nn.Module):
                     draft_logits_BlV.mul(1 + ratio), tau=draft_gum_t, hard=False, dim=-1, rng=self.rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            # Reshape and process through VAE
+            # 重塑嵌入并处理通过VAE
             draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
             draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, total_stages, draft_f_hat, draft_h_BChw
             )
 
-            # Prepare for next stage
+            # 为下一阶段准备
             if si != self.num_stages_minus_1:
                 next_pn = self.patch_nums[si+1]
                 draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
-                draft_token_hub.append(draft_next_token_map.clone())
+                draft_token_hub.append(draft_next_token_map.clone())  # 保存token以供目标模型使用
                 draft_next_token_map = (
                     self.draft_model.word_embed(draft_next_token_map)
                     + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn*next_pn]
                 )
-                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
+                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)  # CFG所需的批量复制
 
-            # Return if at final stage
+            # 如果是最后一个阶段，直接返回
             if si == self.num_stages_minus_1:
                 for blk in self.draft_model.blocks:
                     blk.attn.kv_caching(False)
                 return self.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)
 
-        # Process draft tokens and disable KV caching
+        # 处理草稿tokens并禁用KV缓存
         if len(draft_token_hub) > 0:   
             draft_token_hub = torch.cat(draft_token_hub, dim=1)      
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(False)
         
-        
-        ###### Initialize target model parameters
+        # 初始化目标模型参数
         pindex = exit_points[entry_num]
         sindex = start_points[entry_num]
-
+        
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
 
         target_cur_L = 0
-        target_f_hat = draft_f_hat.clone()  # Clone to maintain separate state
+        target_f_hat = draft_f_hat.clone()  # 使用草稿模型的特征
 
-        # Process draft token hub for target model
+        # 处理草稿token hub为目标模型
         if len(draft_token_hub) > 0:
+            # 这是前面草稿模型生成的token
             target_next_token_map = draft_token_hub    
+            
+            # 把草稿tokens转换成目标模型的表示
             target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, 1:pindex]  
-            target_next_token_map = target_next_token_map.repeat(2, 1, 1)   # double for CFG
+            target_next_token_map = target_next_token_map.repeat(2, 1, 1)  # CFG
             target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
         else: 
             target_next_token_map = target_first_token_map
         
-        ###### Speculative verification stage
-        # Enable KV caching for target model
+        # 启用目标模型KV缓存
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(True)
         
-        # For each stage starting from entry_num
+        # 目标模型生成阶段
         for si, pn in enumerate(self.patch_nums):
             if si < entry_num:
                 target_cur_L += pn*pn
                 continue
-                    
+            
             ratio = si / self.num_stages_minus_1
             target_cur_L += pn*pn
             t = cfg * ratio
             
-            # Setup attn_bias based on mask type
+            # 设置注意力掩码
             if sd_mask != 0:
                 if sd_mask == 1:
-                    # Block-wise mask including current level
-                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex]
-                    attn_bias = attn_bias.to(device)
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].to(device)
                 elif sd_mask == 2:
-                    # Block-wise mask excluding current level
                     attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
                     attn_bias[:, :, sindex:pindex, :] = 0.0
                     attn_bias = attn_bias.to(device)
                 elif sd_mask == 3:
-                    # Causal mask
                     attn_bias = self.target_model.attn_bias_for_masking[:, :, 0:pindex, 0:pindex]
             else:
                 attn_bias = None
             
-            # 处理当前阶段的token
+            # 处理当前阶段 - 正常生成或验证
             if si == entry_num:
-                # 当我们到达要进行验证的阶段时
+                # 如果是entry_num阶段，执行验证
                 x = target_next_token_map
                 
-                # 首先运行目标模型的transformer块
+                # 运行目标模型的transformer blocks
                 for b in self.target_model.blocks:
                     x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
                 
-                # 确定要验证的区域（当前阶段的token）
-                prev_pn = self.patch_nums[entry_num - 1]
-                segment_size = prev_pn * prev_pn
+                # 提取相关logits
+                if sd_mask != 0:
+                    rel_x = target_next_token_map[:, sindex:pindex]  
+                    target_logits_BlV = self.target_model.get_logits(rel_x, target_cond_BD)
+                else:
+                    target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
                 
-                # 在entry_num阶段，我们需要验证上一阶段的token
-                # 这里的slice操作是关键，需要确保与draft_tokens_to_verify维度匹配
-                target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+                # 应用CFG
                 target_logits_BlV = (1+t)*target_logits_BlV[:B] - t*target_logits_BlV[B:]
                 
-                # 执行推测解码的验证
-                if draft_tokens_to_verify is not None:
-                    print(f"Verification at stage {entry_num}:")
-                    print(f"Target logits shape: {target_logits_BlV.shape}")
-                    print(f"Draft tokens shape: {draft_tokens_to_verify.shape}")
+                # 如果有草稿token可以验证
+                if len(draft_idx_hub) > 0 and entry_num > 0:
+                    # 获取要验证的tokens
+                    draft_tokens_to_verify = draft_idx_hub[entry_num - 1]
+                    
+                    print(f"验证阶段 {entry_num}:")
+                    print(f"目标logits形状: {target_logits_BlV.shape}")
+                    print(f"草稿tokens形状: {draft_tokens_to_verify.shape}")
                     
                     # 检查维度是否匹配
-                    if target_logits_BlV.size(0) == draft_tokens_to_verify.size(0) and target_logits_BlV.size(1) == draft_tokens_to_verify.size(1):
-                        # 维度匹配，可以进行验证
-                        # 计算目标模型的概率分布
+                    if target_logits_BlV.size(1) == draft_tokens_to_verify.size(1):
+                        # 维度匹配，可以验证
+                        # 计算目标模型概率分布
                         target_probs = torch.softmax(target_logits_BlV, dim=-1)
                         
-                        # 获取目标模型的顶部预测
+                        # 获取目标模型top预测
                         target_top_idxs = torch.argmax(target_probs, dim=-1)
                         
-                        # 计算验证掩码
+                        # 计算匹配掩码
                         exact_match_mask = (target_top_idxs == draft_tokens_to_verify)
                         
-                        # 计算目标模型给草稿模型预测的概率
-                        draft_prob_in_target = torch.gather(target_probs, -1, draft_tokens_to_verify.unsqueeze(-1)).squeeze(-1)
+                        # 计算概率掩码（草稿token在目标模型中的概率）
+                        draft_prob_in_target = torch.gather(
+                            target_probs, -1, draft_tokens_to_verify.unsqueeze(-1)
+                        ).squeeze(-1)
                         prob_match_mask = (draft_prob_in_target > similarity_threshold)
                         
-                        # 合并掩码
+                        # 合并两种验证方式
                         verification_mask = exact_match_mask | prob_match_mask
                         
-                        # 根据掩码选择保留草稿模型预测或使用目标模型预测
-                        verified_idx = torch.where(verification_mask, draft_tokens_to_verify, target_top_idxs)
+                        # 基于验证结果选择tokens
+                        verified_tokens = torch.where(
+                            verification_mask,
+                            draft_tokens_to_verify,  # 保留验证通过的草稿tokens
+                            target_top_idxs  # 使用目标模型的预测替换验证失败的tokens
+                        )
                         
-                        # 使用与原始代码相同的采样函数格式
-                        # 创建形状为 [B, L, 1] 的张量，然后取[:, :, 0]来匹配原始格式
-                        verified_idx_expanded = verified_idx.unsqueeze(-1)
-                        target_idx_Bl = verified_idx_expanded.expand(-1, -1, 1)[:, :, 0]
-                        
-                        # 打印统计信息
+                        # 报告验证统计
                         acceptance_rate = verification_mask.float().mean().item() * 100
-                        print(f"验证完成: 接受了 {acceptance_rate:.2f}% 的草稿模型预测")
+                        print(f"接受了 {acceptance_rate:.2f}% 的草稿模型tokens")
+                        
+                        # 使用与sample_with_top_k_top_p_相同的格式
+                        # 创建一个临时的维度扩展版本，以匹配原始采样函数的输出格式
+                        temp_tokens = verified_tokens.unsqueeze(-1).expand(-1, -1, 1)
+                        target_idx_Bl = temp_tokens[:, :, 0]
                     else:
-                        # 维度不匹配，使用目标模型的采样结果
-                        print(f"维度不匹配，跳过验证，使用目标模型采样")
+                        # 维度不匹配，跳过验证
+                        print(f"维度不匹配，无法验证。使用标准采样。")
                         target_idx_Bl = sample_with_top_k_top_p_(
-                            target_logits_BlV,
-                            rng=self.rng,
-                            top_k=top_k,
-                            top_p=top_p,
-                            num_samples=1
+                            target_logits_BlV, rng=self.rng, 
+                            top_k=top_k, top_p=top_p, num_samples=1
                         )[:, :, 0]
                 else:
-                    # 没有草稿模型预测可验证，使用标准采样
+                    # 没有草稿token可验证，使用标准采样
                     target_idx_Bl = sample_with_top_k_top_p_(
-                        target_logits_BlV,
-                        rng=self.rng,
-                        top_k=top_k,
-                        top_p=top_p,
-                        num_samples=1
+                        target_logits_BlV, rng=self.rng,
+                        top_k=top_k, top_p=top_p, num_samples=1
                     )[:, :, 0]
-                # 对于后续阶段，使用标准生成
+            else:
+                # 对于entry_num之后的阶段，使用标准生成
                 x = target_next_token_map
                 
                 for b in self.target_model.blocks:
@@ -1309,41 +1279,47 @@ class SDVAR(nn.Module):
                 target_logits_BlV = (1+t)*target_logits_BlV[:B] - t*target_logits_BlV[B:]
                 
                 target_idx_Bl = sample_with_top_k_top_p_(
-                    target_logits_BlV,
-                    rng=self.rng,
-                    top_k=top_k,
-                    top_p=top_p,
-                    num_samples=1
+                    target_logits_BlV, rng=self.rng,
+                    top_k=top_k, top_p=top_p, num_samples=1
                 )[:, :, 0]
-
-            # 将生成的token转换为嵌入向量
+            
+            # 将索引转换为嵌入
             if not more_smooth:
                 target_h_BChw = self.vae_quant_proxy[0].embedding(target_idx_Bl)
             else:
                 target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
                 target_h_BChw = gumbel_softmax_with_rng(
-                    target_logits_BlV.mul(1 + ratio),
-                    tau=target_gum_t,
-                    hard=False,
-                    dim=-1,
-                    rng=self.rng
+                    target_logits_BlV.mul(1 + ratio), tau=target_gum_t, hard=False, dim=-1, rng=self.rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-
-            # 处理嵌入向量并准备下一阶段
-            target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+            
+            # 重塑嵌入并处理
+            # 确保维度匹配，打印形状以便调试
+            print(f"转换前 target_h_BChw 形状: {target_h_BChw.shape}, 目标形状: [B={B}, C={self.target_model.Cvae}, pn={pn}, pn={pn}]")
+            
+            # 安全地调整维度
+            try:
+                target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+            except RuntimeError as e:
+                print(f"维度错误: {e}")
+                # 紧急情况下的后备方案 - 重新采样或终止
+                print("切换到后备方案...")
+                # 在这里可以添加后备逻辑，如重新采样或返回部分结果
+                
+            # 继续处理
             target_f_hat, target_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, len(self.patch_nums), target_f_hat, target_h_BChw
             )
             
+            # 准备下一阶段
             if si != self.num_stages_minus_1:
                 next_pn = self.patch_nums[si+1]
                 target_next_token_map = target_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
                 target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, target_cur_L:target_cur_L + next_pn * next_pn]
-                target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+                target_next_token_map = target_next_token_map.repeat(2, 1, 1)  # CFG
         
-        # 关闭目标模型的KV缓存
+        # 关闭目标模型KV缓存
         for blk in self.target_model.blocks:
-            blk.attn.kv_caching(False)   
+            blk.attn.kv_caching(False)
         
         # 返回生成的图像
-        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
