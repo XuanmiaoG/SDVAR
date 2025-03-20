@@ -1023,40 +1023,29 @@ class SDVAR(nn.Module):
         top_k: int = 0,
         top_p: float = 0.0,
         more_smooth: bool = False,
-        entry_num: int = 10, 
+        entry_num: int = 10,
         sd_mask: int = 0,
         similarity_threshold: float = 0.8,
-        verification_k: int = 10  # 增加k值以提高接受率
+        draft_steps: int = 2,  # 每次draft模型预测的步数
+        verification_k: int = 5  # top-k验证参数
     ):
         """
-        Speculative decoding implementation for VAR model
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling parameter for normal sampling
-        :param top_p: top-p sampling parameter for normal sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization
-        :param entry_num: entry point for target model
-        :param sd_mask: masking strategy (0: no mask, 1-3: different mask types)
-        :param similarity_threshold: threshold for accepting draft tokens based on probability
-        :param verification_k: k value for top-k verification
-        :return: Generated image tensor (B, 3, H, W) in [0, 1] range
+        Speculative decoding implementation for VAR model with modular design
         """
-        # 对于很小的entry_num，直接使用目标模型
+        # 对于小的entry_num直接使用目标模型
         if entry_num <= 1:
-            print(f"entry_num={entry_num} 太小，直接使用目标模型")
             return self.target_model.autoregressive_infer_cfg(
-                B=B, label_B=label_B, g_seed=g_seed, 
-                cfg=cfg, top_k=top_k, top_p=top_p, more_smooth=more_smooth
+                B=B, label_B=label_B, g_seed=g_seed, cfg=cfg,
+                top_k=top_k, top_p=top_p, more_smooth=more_smooth
             )
         
-        # 初始化共用参数
+        # 初始化共同参数
         assert self.draft_model.patch_nums == self.target_model.patch_nums
+        assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
         self.num_stages_minus_1 = self.draft_model.num_stages_minus_1
-        
         total_stages = len(self.patch_nums)
+        
         start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
         exit_points = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
         device = torch.device("cuda:0")
@@ -1068,134 +1057,224 @@ class SDVAR(nn.Module):
             self.rng = self.target_model.rng.manual_seed(g_seed)
         else:
             self.rng = None
-
-        # 处理标签
+        
+        # 处理标签批次
         if label_B is None:
             label_B = torch.multinomial(
                 self.target_model.uniform_prob, num_samples=B, replacement=True, generator=self.rng
             ).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full(
-                (B,), fill_value=self.target_model.num_classes if label_B < 0 else label_B,
+                (B,),
+                fill_value=self.target_model.num_classes if label_B < 0 else label_B,
                 device=self.target_model.lvl_1L.device
             )
-
-        # 初始化草稿模型参数
-        draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
-        draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
-
-        draft_cur_L = 0
-        draft_next_token_map = draft_first_token_map
-        draft_token_hub = []
         
-        # 保存草稿模型的tokens以供验证
-        draft_idx_hub = []
+        # 第1阶段：使用目标模型进行暖身步骤（warmup_steps）
+        # 初始化模型参数
+        warmup_steps = min(entry_num - 1, 2)  # 使用至少1个但不超过entry_num-1的暖身步骤
         
-        # 启用草稿模型的KV缓存
-        for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(True)
-
-        # 使用草稿模型生成直到entry_num
-        for si, pn in enumerate(self.patch_nums):
-            if si >= entry_num:
-                break
-
-            ratio = si / self.num_stages_minus_1
-            draft_cur_L += pn*pn
-            x = draft_next_token_map
-            
-            # 通过草稿模型的transformer blocks
-            for blk in self.draft_model.blocks:
-                x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
-            
-            # 获取草稿模型的logits并应用CFG
-            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)            
-            t = cfg * ratio
-            draft_logits_BlV = (1+t)*draft_logits_BlV[:B] - t*draft_logits_BlV[B:]
-            
-            # 采样tokens
-            draft_idx_Bl = sample_with_top_k_top_p_(
-                draft_logits_BlV, rng=self.rng, top_k=top_k, top_p=top_p, num_samples=1
-            )[:, :, 0]
-            
-            # 保存生成的索引用于验证
-            if si == entry_num - 1:
-                draft_idx_hub.append(draft_idx_Bl.clone())
-                print(f"保存草稿tokens在阶段 {si}, 形状: {draft_idx_Bl.shape}")
-            
-            # 将索引转换为嵌入
-            if not more_smooth:
-                draft_h_BChw = self.vae_quant_proxy[0].embedding(draft_idx_Bl)
-            else:
-                draft_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
-                draft_h_BChw = gumbel_softmax_with_rng(
-                    draft_logits_BlV.mul(1 + ratio), tau=draft_gum_t, hard=False, dim=-1, rng=self.rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
-            # 重塑嵌入并处理通过VAE
-            draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
-            draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
-                si, total_stages, draft_f_hat, draft_h_BChw
-            )
-
-            # 为下一阶段准备
-            if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si+1]
-                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
-                draft_token_hub.append(draft_next_token_map.clone())
-                draft_next_token_map = (
-                    self.draft_model.word_embed(draft_next_token_map)
-                    + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn*next_pn]
-                )
-                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
-
-            # 如果是最后一个阶段，直接返回
-            if si == self.num_stages_minus_1:
-                for blk in self.draft_model.blocks:
-                    blk.attn.kv_caching(False)
-                return self.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)
-
-        # 处理草稿tokens并禁用KV缓存
-        if len(draft_token_hub) > 0:   
-            draft_token_hub = torch.cat(draft_token_hub, dim=1)      
-        for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(False)
+        print(f"执行{warmup_steps}步暖身...")
         
-        # 初始化目标模型参数
-        pindex = exit_points[entry_num]
-        sindex = start_points[entry_num]
-        
+        # 初始化target模型参数
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
-
-        target_cur_L = 0
-        target_f_hat = draft_f_hat.clone()
-
-        # 处理草稿token hub为目标模型
-        if len(draft_token_hub) > 0:
-            target_next_token_map = draft_token_hub    
-            target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, 1:pindex]  
-            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
-            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
-        else: 
-            target_next_token_map = target_first_token_map
         
-        # 启用目标模型KV缓存
-        for blk in self.target_model.blocks:
-            blk.attn.kv_caching(True)
+        # 辅助函数：目标模型生成n步
+        def target_generate_steps(start_step, num_steps, next_token_map, f_hat):
+            """目标模型连续生成num_steps步的token"""
+            current_token_map = next_token_map
+            current_f_hat = f_hat
+            token_hub = []
+            f_hat_history = []
+            token_id_history = []
+            
+            # 打开KV缓存
+            for blk in self.target_model.blocks:
+                blk.attn.kv_caching(True)
+            
+            for i in range(num_steps):
+                si = start_step + i
+                if si >= total_stages:
+                    break
+                    
+                pn = self.patch_nums[si]
+                ratio = si / self.num_stages_minus_1
+                t = cfg * ratio
+                
+                # 处理当前token
+                x = current_token_map
+                
+                # 通过transformer块
+                for b in self.target_model.blocks:
+                    x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+                
+                # 获取logits并应用CFG
+                target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+                target_logits_BlV = (1+t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
+                
+                # 采样token
+                target_idx_Bl = sample_with_top_k_top_p_(
+                    target_logits_BlV,
+                    rng=self.rng,
+                    top_k=top_k,
+                    top_p=top_p,
+                    num_samples=1
+                )[:, :, 0]
+                
+                # 保存token ID
+                token_id_history.append(target_idx_Bl.clone())
+                
+                # 转换为嵌入向量
+                if not more_smooth:
+                    target_h_BChw = self.vae_quant_proxy[0].embedding(target_idx_Bl)
+                else:
+                    target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                    target_h_BChw = gumbel_softmax_with_rng(
+                        target_logits_BlV.mul(1 + ratio),
+                        tau=target_gum_t,
+                        hard=False,
+                        dim=-1,
+                        rng=self.rng
+                    ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                
+                # 转换形状并处理
+                target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+                current_f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                    si, total_stages, current_f_hat, target_h_BChw
+                )
+                
+                # 保存状态历史
+                f_hat_history.append(current_f_hat.clone())
+                
+                # 准备下一阶段
+                if si != self.num_stages_minus_1:
+                    next_pn = self.patch_nums[si+1]
+                    next_token_map = next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
+                    token_hub.append(next_token_map.clone())
+                    
+                    current_token_map = self.target_model.word_embed(next_token_map) + \
+                        target_lvl_pos[:, (si+1==0)*0 + (si+1>0)*(start_points[si+1 if si+1 < len(start_points) else -1])]
+                    current_token_map = current_token_map.repeat(2, 1, 1)
+                
+            # 关闭KV缓存
+            for blk in self.target_model.blocks:
+                blk.attn.kv_caching(False)
+            
+            if len(token_hub) > 0:
+                token_hub = torch.cat(token_hub, dim=1)
+            
+            return token_hub, current_f_hat, f_hat_history, token_id_history, next_token_map
         
-        # 目标模型生成阶段
-        for si, pn in enumerate(self.patch_nums):
-            if si < entry_num:
-                target_cur_L += pn*pn
-                continue
+        # 辅助函数：draft模型生成n步
+        def draft_generate_steps(start_step, num_steps, next_token_map, f_hat):
+            """draft模型连续生成num_steps步的token"""
+            # 初始化draft模型参数
+            draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
+            draft_lvl_pos, _, _ = self.init_param(self.draft_model, B, label_B)
             
-            ratio = si / self.num_stages_minus_1
-            target_cur_L += pn*pn
-            t = cfg * ratio
+            current_token_map = next_token_map
+            current_f_hat = f_hat
+            token_hub = []
+            input_token_history = []
+            f_hat_history = []
+            token_id_history = []
             
-            # 设置注意力掩码
+            # 打开KV缓存
+            for blk in self.draft_model.blocks:
+                blk.attn.kv_caching(True)
+            
+            for i in range(num_steps):
+                si = start_step + i
+                if si >= total_stages:
+                    break
+                    
+                pn = self.patch_nums[si]
+                ratio = si / self.num_stages_minus_1
+                t = cfg * ratio
+                
+                # 保存输入token用于验证
+                input_token_history.append(current_token_map.clone())
+                
+                # 处理当前token
+                x = current_token_map
+                
+                # 通过transformer块
+                for blk in self.draft_model.blocks:
+                    x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
+                
+                # 获取logits并应用CFG
+                draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
+                draft_logits_BlV = (1+t) * draft_logits_BlV[:B] - t * draft_logits_BlV[B:]
+                
+                # 采样token
+                draft_idx_Bl = sample_with_top_k_top_p_(
+                    draft_logits_BlV,
+                    rng=self.rng,
+                    top_k=top_k,
+                    top_p=top_p,
+                    num_samples=1
+                )[:, :, 0]
+                
+                # 保存token ID
+                token_id_history.append(draft_idx_Bl.clone())
+                
+                # 转换为嵌入向量
+                if not more_smooth:
+                    draft_h_BChw = self.vae_quant_proxy[0].embedding(draft_idx_Bl)
+                else:
+                    draft_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                    draft_h_BChw = gumbel_softmax_with_rng(
+                        draft_logits_BlV.mul(1 + ratio),
+                        tau=draft_gum_t,
+                        hard=False,
+                        dim=-1,
+                        rng=self.rng
+                    ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                
+                # 转换形状并处理
+                draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+                current_f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                    si, total_stages, current_f_hat, draft_h_BChw
+                )
+                
+                # 保存状态历史
+                f_hat_history.append(current_f_hat.clone())
+                
+                # 准备下一阶段
+                if si != self.num_stages_minus_1 and i < num_steps - 1:
+                    next_pn = self.patch_nums[si+1]
+                    next_token_map = next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
+                    token_hub.append(next_token_map.clone())
+                    
+                    current_token_map = self.draft_model.word_embed(next_token_map) + \
+                        draft_lvl_pos[:, (si+1==0)*0 + (si+1>0)*(start_points[si+1 if si+1 < len(start_points) else -1])]
+                    current_token_map = current_token_map.repeat(2, 1, 1)
+            
+            # 关闭KV缓存
+            for blk in self.draft_model.blocks:
+                blk.attn.kv_caching(False)
+            
+            if len(token_hub) > 0:
+                token_hub = torch.cat(token_hub, dim=1)
+            
+            return input_token_history, f_hat_history, token_hub, token_id_history, next_token_map, current_f_hat
+        
+        # 辅助函数：目标模型验证draft模型的token
+        def target_verify_tokens(current_step, draft_tokens, current_token_map, f_hat):
+            """目标模型验证draft模型生成的tokens"""
+            # 打开KV缓存
+            for blk in self.target_model.blocks:
+                blk.attn.kv_caching(True)
+            
+            # 处理当前token
+            x = current_token_map
+            
+            # 配置mask
             if sd_mask != 0:
+                pindex = exit_points[current_step if current_step < len(exit_points) else -1]
+                sindex = start_points[current_step if current_step < len(start_points) else -1]
+                
                 if sd_mask == 1:
                     attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].to(device)
                 elif sd_mask == 2:
@@ -1207,170 +1286,209 @@ class SDVAR(nn.Module):
             else:
                 attn_bias = None
             
-            # 处理当前阶段
-            x = target_next_token_map
-            
-            # 运行目标模型的transformer blocks
+            # 通过transformer块
             for b in self.target_model.blocks:
-                x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias if si == entry_num else None)
+                x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
             
-            # 获取logits
-            if si == entry_num and sd_mask != 0:
-                rel_x = target_next_token_map[:, sindex:pindex]
-                target_logits_BlV = self.target_model.get_logits(rel_x, target_cond_BD)
-            else:
-                target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+            # 获取当前步骤的logits
+            target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
             
             # 应用CFG
-            target_logits_BlV = (1+t)*target_logits_BlV[:B] - t*target_logits_BlV[B:]
+            ratio = current_step / self.num_stages_minus_1
+            t = cfg * ratio
+            target_logits_BlV = (1+t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
             
-            # 推测解码验证步骤 - 只在entry_num阶段执行
-            if si == entry_num and len(draft_idx_hub) > 0:
-                # 获取最新的草稿tokens（上一阶段生成的）
-                draft_tokens = draft_idx_hub[-1]
-                
-                print(f"验证阶段 {entry_num}:")
-                print(f"目标logits形状: {target_logits_BlV.shape}")
-                print(f"草稿tokens形状: {draft_tokens.shape}")
-                
-                # 计算目标模型的概率分布
-                target_probs = torch.softmax(target_logits_BlV, dim=-1)
-                target_top_idxs = torch.argmax(target_probs, dim=-1)
-                
-                # 获取当前和前一个阶段的patch大小
-                prev_pn = self.patch_nums[entry_num - 1]
-                curr_pn = pn
-                
-                # 检查形状是否相同
-                if target_logits_BlV.size(1) == draft_tokens.size(1):
-                    # 形状匹配情况 - 使用直接验证
-                    # 取目标模型每个位置的top-k预测
-                    top_k_values, top_k_indices = torch.topk(target_probs, k=verification_k, dim=-1)
-                    
-                    # 检查草稿token是否在top-k中
-                    draft_tokens_expanded = draft_tokens.unsqueeze(-1)
-                    is_in_topk = (top_k_indices == draft_tokens_expanded).any(dim=-1)
-                    
-                    # 在top-k中接受，否则使用目标模型的预测
-                    verified_idx_Bl = torch.where(
-                        is_in_topk,
-                        draft_tokens,
-                        target_top_idxs
-                    )
-                    
-                    # 计算接受率
-                    acceptance_rate = is_in_topk.float().mean().item() * 100
-                    print(f"直接验证: 接受了 {acceptance_rate:.2f}% 的草稿模型预测")
-                else:
-                    # 形状不匹配情况 - 使用空间映射验证
-                    print(f"形状不匹配，使用空间映射验证方法 (prev_pn={prev_pn}, curr_pn={curr_pn})")
-                    
-                    # 创建2D空间映射
-                    draft_indices = []
-                    target_indices = []
-                    
-                    # 获取tokens大小
-                    draft_size = draft_tokens.size(1)
-                    target_size = target_logits_BlV.size(1)
-                    
-                    if draft_size < target_size:
-                        # 对于草稿token少于目标token的情况
-                        # 创建2D网格的空间映射
-                        
-                        # 对每个小网格位置进行映射
-                        for y_small in range(prev_pn):
-                            for x_small in range(prev_pn):
-                                # 计算对应的大网格区域
-                                y_start = y_small * curr_pn // prev_pn
-                                x_start = x_small * curr_pn // prev_pn
-                                
-                                # 映射到大网格中心位置
-                                y_center = min(y_start + (curr_pn // prev_pn) // 2, curr_pn - 1)
-                                x_center = min(x_start + (curr_pn // prev_pn) // 2, curr_pn - 1)
-                                
-                                # 将2D索引扁平化为1D
-                                draft_idx = y_small * prev_pn + x_small
-                                target_idx = y_center * curr_pn + x_center
-                                
-                                # 确保索引在范围内
-                                if target_idx < target_size and draft_idx < draft_size:
-                                    draft_indices.append(draft_idx)
-                                    target_indices.append(target_idx)
-                        
-                        print(f"创建了 {len(draft_indices)} 个从草稿tokens到目标tokens的映射")
-                    else:
-                        # 草稿token多于目标token的情况（罕见）
-                        # 这种情况下可能需要更复杂的映射逻辑
-                        print(f"草稿tokens数量({draft_size})大于目标tokens数量({target_size})，使用线性映射")
-                        
-                        for i in range(target_size):
-                            mapping_idx = min(int(i * draft_size / target_size), draft_size - 1)
-                            draft_indices.append(mapping_idx)
-                            target_indices.append(i)
-                    
-                    # 进行验证
-                    verified_idx_Bl = target_top_idxs.clone()  # 默认使用目标模型预测
-                    verified_count = 0
-                    
-                    # 对每个映射对进行验证
-                    for draft_idx, target_idx in zip(draft_indices, target_indices):
-                        # 获取该位置的top-k预测
-                        topk_values, topk_indices = torch.topk(target_probs[:, target_idx], k=verification_k, dim=-1)
-                        
-                        # 检查每个batch中的token
-                        for batch_idx in range(B):
-                            draft_token = draft_tokens[batch_idx, draft_idx]
-                            is_in_topk = (topk_indices[batch_idx] == draft_token).any().item()
-                            
-                            if is_in_topk:
-                                verified_count += 1
-                                # 在验证位置使用草稿token
-                                verified_idx_Bl[batch_idx, target_idx] = draft_token
-                    
-                    # 计算总体接受率
-                    total_verifications = len(draft_indices) * B
-                    acceptance_rate = (verified_count / total_verifications) * 100 if total_verifications > 0 else 0
-                    print(f"空间映射验证: 接受了 {verified_count}/{total_verifications} ({acceptance_rate:.2f}%) 的草稿模型预测")
-                
-                # 使用验证后的索引
-                target_idx_Bl = verified_idx_Bl
-            else:
-                # 非验证阶段，使用标准采样
-                target_idx_Bl = sample_with_top_k_top_p_(
-                    target_logits_BlV, rng=self.rng,
-                    top_k=top_k, top_p=top_p, num_samples=1
-                )[:, :, 0]
+            # 关闭KV缓存
+            for blk in self.target_model.blocks:
+                blk.attn.kv_caching(False)
             
-            # 将索引转换为嵌入
-            if not more_smooth:
-                target_h_BChw = self.vae_quant_proxy[0].embedding(target_idx_Bl)
-            else:
-                target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
-                target_h_BChw = gumbel_softmax_with_rng(
-                    target_logits_BlV.mul(1 + ratio), tau=target_gum_t, hard=False, dim=-1, rng=self.rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            # 计算验证结果
+            target_probs = torch.softmax(target_logits_BlV, dim=-1)
             
-            # 打印形状信息用于调试
-            print(f"转换前 target_h_BChw 形状: {target_h_BChw.shape}, 目标形状: [B={B}, C={self.target_model.Cvae}, pn={pn}, pn={pn}]")
+            # Top-k验证
+            topk_values, topk_indices = torch.topk(target_probs, k=verification_k, dim=-1)
+            is_in_topk = (topk_indices == draft_tokens.unsqueeze(-1)).any(dim=-1)
             
-            # 重塑嵌入，确保正确的维度
-            target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+            # 计算目标模型给draft token的概率
+            draft_probs = torch.gather(target_probs, -1, draft_tokens.unsqueeze(-1)).squeeze(-1)
+            prob_match = draft_probs > similarity_threshold
             
-            # 处理通过VAE
-            target_f_hat, target_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
-                si, len(self.patch_nums), target_f_hat, target_h_BChw
+            # 合并验证结果：top-k或概率阈值任一满足即可接受
+            verification_mask = is_in_topk | prob_match
+            
+            # 计算接受率
+            acceptance_rate = verification_mask.float().mean().item()
+            
+            # 创建验证后的token：对于验证失败的位置，使用目标模型的预测
+            verified_tokens = torch.where(
+                verification_mask,
+                draft_tokens,                           # 保留通过验证的draft tokens
+                torch.argmax(target_probs, dim=-1)      # 对未通过验证的位置使用target模型的预测
             )
             
-            # 为下一阶段准备
-            if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si+1]
-                target_next_token_map = target_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
-                target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, target_cur_L:target_cur_L + next_pn * next_pn]
-                target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+            return verified_tokens, target_logits_BlV, acceptance_rate, verification_mask
         
-        # 关闭目标模型KV缓存
-        for blk in self.target_model.blocks:
-            blk.attn.kv_caching(False)
+        # 开始生成过程
+        current_step = 0
         
-        # 返回生成的图像
-        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
+        # 第1阶段：使用target模型暖身
+        warmup_token_hub, target_f_hat, warmup_f_hat_history, warmup_token_id_history, next_token_map = \
+            target_generate_steps(current_step, warmup_steps, target_first_token_map, target_f_hat)
+        
+        current_step += warmup_steps
+        
+        # 准备下一阶段的token map
+        if len(warmup_token_hub) > 0:
+            size_needed = start_points[current_step] if current_step < len(start_points) else 0
+            
+            if warmup_token_hub.size(1) < size_needed:
+                # 填充不足的部分
+                padding = torch.zeros(B, size_needed - warmup_token_hub.size(1), warmup_token_hub.size(2), 
+                                    device=warmup_token_hub.device)
+                warmup_token_hub = torch.cat([warmup_token_hub, padding], dim=1)
+            elif warmup_token_hub.size(1) > size_needed:
+                # 截取所需部分
+                warmup_token_hub = warmup_token_hub[:, :size_needed]
+            
+            target_next_token_map = self.target_model.word_embed(warmup_token_hub) + \
+                target_lvl_pos[:, 1:size_needed+1]
+            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
+        else:
+            target_next_token_map = target_first_token_map
+        
+        print(f"暖身完成，当前步骤: {current_step}/{total_stages}")
+        
+        # 第2阶段：推测解码主循环
+        while current_step < total_stages:
+            # 计算当前批次可预测的步数
+            steps_to_predict = min(draft_steps, total_stages - current_step)
+            if steps_to_predict <= 0:
+                break
+                
+            print(f"使用draft模型预测 {steps_to_predict} 步...")
+            
+            # 使用draft模型生成几个步骤
+            draft_input_token_history, draft_f_hat_history, draft_token_hub, draft_token_id_history, \
+            draft_next_token_map, draft_f_hat = draft_generate_steps(
+                current_step, steps_to_predict, target_next_token_map, target_f_hat
+            )
+            
+            # 使用target模型验证
+            accepted_steps = 0
+            for i in range(steps_to_predict):
+                si = current_step + i
+                pn = self.patch_nums[si]
+                
+                print(f"验证步骤 {si}...")
+                
+                if i == 0:
+                    # 第一步使用当前token map
+                    verification_token_map = target_next_token_map
+                else:
+                    # 后续步骤使用上一步生成的next_token_map
+                    prev_token = draft_token_id_history[i-1]
+                    ratio = (si-1) / self.num_stages_minus_1
+                    
+                    if not more_smooth:
+                        h_BChw = self.vae_quant_proxy[0].embedding(prev_token)
+                    else:
+                        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                        h_BChw = gumbel_softmax_with_rng(
+                            torch.zeros_like(prev_token).unsqueeze(-1).expand(-1, -1, self.target_model.V) \
+                                .scatter_(-1, prev_token.unsqueeze(-1), 1.0).mul(1 + ratio),
+                            tau=gum_t, hard=False, dim=-1, rng=self.rng
+                        ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                    
+                    prev_pn = self.patch_nums[si-1]
+                    h_BChw = h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, prev_pn, prev_pn)
+                    _, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                        si-1, total_stages, draft_f_hat_history[i-1], h_BChw
+                    )
+                    
+                    next_pn = self.patch_nums[si]
+                    next_token_map = next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
+                    verification_token_map = self.target_model.word_embed(next_token_map) + \
+                        target_lvl_pos[:, start_points[si if si < len(start_points) else -1]]
+                    verification_token_map = verification_token_map.repeat(2, 1, 1)
+                
+                # 验证当前步骤
+                verified_tokens, _, acceptance_rate, verification_mask = target_verify_tokens(
+                    si, draft_token_id_history[i], verification_token_map, 
+                    draft_f_hat_history[i-1] if i > 0 else target_f_hat
+                )
+                
+                print(f"  步骤 {si} 接受率: {acceptance_rate*100:.2f}%")
+                
+                if acceptance_rate >= similarity_threshold:
+                    # 接受当前步骤，继续验证下一步
+                    accepted_steps += 1
+                    
+                    # 最后一步不需要准备next_token_map
+                    if i == steps_to_predict - 1:
+                        target_f_hat = draft_f_hat_history[i].clone()
+                        
+                        if si < total_stages - 1:
+                            # 准备下一阶段的token map
+                            next_pn = self.patch_nums[si+1]
+                            token_map = draft_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
+                            target_next_token_map = self.target_model.word_embed(token_map) + \
+                                target_lvl_pos[:, start_points[si+1 if si+1 < len(start_points) else -1]]
+                            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+                else:
+                    # 拒绝当前步骤，使用verified_tokens生成正确的next_token_map
+                    print(f"  拒绝步骤 {si}，使用验证后的token")
+                    
+                    # 转换验证后的token为嵌入向量
+                    ratio = si / self.num_stages_minus_1
+                    
+                    if not more_smooth:
+                        target_h_BChw = self.vae_quant_proxy[0].embedding(verified_tokens)
+                    else:
+                        target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                        target_h_BChw = gumbel_softmax_with_rng(
+                            torch.zeros_like(verified_tokens).unsqueeze(-1).expand(-1, -1, self.target_model.V) \
+                                .scatter_(-1, verified_tokens.unsqueeze(-1), 1.0).mul(1 + ratio),
+                            tau=target_gum_t, hard=False, dim=-1, rng=self.rng
+                        ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                    
+                    # 转换形状并处理
+                    target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+                    
+                    # 使用正确的上一步状态
+                    prev_f_hat = draft_f_hat_history[i-1] if i > 0 else target_f_hat
+                    
+                    target_f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                        si, total_stages, prev_f_hat, target_h_BChw
+                    )
+                    
+                    # 准备下一阶段的token map
+                    if si < total_stages - 1:
+                        next_pn = self.patch_nums[si+1]
+                        next_token_map = next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
+                        target_next_token_map = self.target_model.word_embed(next_token_map) + \
+                            target_lvl_pos[:, start_points[si+1 if si+1 < len(start_points) else -1]]
+                        target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+                    
+                    # 中断验证循环，从拒绝的步骤之后重新开始
+                    break
+            
+            # 更新步数
+            current_step += accepted_steps
+            print(f"接受了 {accepted_steps}/{steps_to_predict} 步，当前步骤: {current_step}/{total_stages}")
+            
+            # 如果所有步骤都被拒绝了，使用target模型生成一步
+            if accepted_steps == 0:
+                print("所有步骤都被拒绝，使用target模型生成一步")
+                _, target_f_hat, _, _, next_token_map = target_generate_steps(
+                    current_step, 1, target_next_token_map, target_f_hat
+                )
+                
+                current_step += 1
+                
+                # 准备下一阶段的token map
+                if current_step < total_stages:
+                    target_next_token_map = next_token_map
+        
+        # 生成完成，返回结果
+        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
