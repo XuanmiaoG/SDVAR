@@ -1026,7 +1026,7 @@ class SDVAR(nn.Module):
         entry_num: int = 10, 
         sd_mask: int = 0,
         similarity_threshold: float = 0.8,
-        verification_k: int = 5  # 用于top-k验证的k值
+        verification_k: int = 10  # 增加k值以提高接受率
     ):
         """
         Speculative decoding implementation for VAR model
@@ -1226,8 +1226,8 @@ class SDVAR(nn.Module):
             
             # 推测解码验证步骤 - 只在entry_num阶段执行
             if si == entry_num and len(draft_idx_hub) > 0:
-                #draft_tokens = draft_idx_hub[0]  # 获取要验证的草稿tokens
-                draft_tokens = draft_idx_hub[-1]  # 使用最新保存的draft tokens
+                # 获取最新的草稿tokens（上一阶段生成的）
+                draft_tokens = draft_idx_hub[-1]
                 
                 print(f"验证阶段 {entry_num}:")
                 print(f"目标logits形状: {target_logits_BlV.shape}")
@@ -1237,22 +1237,18 @@ class SDVAR(nn.Module):
                 target_probs = torch.softmax(target_logits_BlV, dim=-1)
                 target_top_idxs = torch.argmax(target_probs, dim=-1)
                 
-                # 尝试灵活的验证方式 - 基于top-k验证
-                accepted = 0
-                total = 0
-                verified_idx_Bl = torch.zeros_like(target_top_idxs)
+                # 获取当前和前一个阶段的patch大小
+                prev_pn = self.patch_nums[entry_num - 1]
+                curr_pn = pn
                 
                 # 检查形状是否相同
                 if target_logits_BlV.size(1) == draft_tokens.size(1):
-                    # 形状匹配情况
+                    # 形状匹配情况 - 使用直接验证
                     # 取目标模型每个位置的top-k预测
                     top_k_values, top_k_indices = torch.topk(target_probs, k=verification_k, dim=-1)
                     
                     # 检查草稿token是否在top-k中
-                    # 转换draft_tokens为[B, L, 1]，以便比较
                     draft_tokens_expanded = draft_tokens.unsqueeze(-1)
-                    
-                    # 判断每个位置的草稿token是否在top-k中
                     is_in_topk = (top_k_indices == draft_tokens_expanded).any(dim=-1)
                     
                     # 在top-k中接受，否则使用目标模型的预测
@@ -1264,36 +1260,51 @@ class SDVAR(nn.Module):
                     
                     # 计算接受率
                     acceptance_rate = is_in_topk.float().mean().item() * 100
-                    print(f"接受了 {acceptance_rate:.2f}% 的草稿模型预测")
+                    print(f"直接验证: 接受了 {acceptance_rate:.2f}% 的草稿模型预测")
                 else:
-                    # 形状不匹配情况 - 使用映射验证
-                    print("形状不匹配，使用映射验证方法")
+                    # 形状不匹配情况 - 使用空间映射验证
+                    print(f"形状不匹配，使用空间映射验证方法 (prev_pn={prev_pn}, curr_pn={curr_pn})")
                     
-                    # 计算映射关系 - 草稿索引到目标索引的映射
-                    prev_pn = self.patch_nums[entry_num - 1]
-                    curr_pn = pn
-                    
-                    # 使用线性插值方法创建映射
+                    # 创建2D空间映射
                     draft_indices = []
                     target_indices = []
                     
-                    # 创建一个映射表，将草稿token的位置映射到目标模型的位置
-                    # 这是一个简化版本，实际应根据具体的模型架构优化
-                    draft_size = prev_pn * prev_pn
+                    # 获取tokens大小
+                    draft_size = draft_tokens.size(1)
                     target_size = target_logits_BlV.size(1)
                     
-                    if draft_size <= target_size:
-                        # 草稿token少于目标token的情况
-                        # 每个草稿token验证一个目标token
-                        for i in range(draft_size):
-                            mapping_idx = int(i * target_size / draft_size)
-                            draft_indices.append(i)
-                            target_indices.append(mapping_idx)
+                    if draft_size < target_size:
+                        # 对于草稿token少于目标token的情况
+                        # 创建2D网格的空间映射
+                        
+                        # 对每个小网格位置进行映射
+                        for y_small in range(prev_pn):
+                            for x_small in range(prev_pn):
+                                # 计算对应的大网格区域
+                                y_start = y_small * curr_pn // prev_pn
+                                x_start = x_small * curr_pn // prev_pn
+                                
+                                # 映射到大网格中心位置
+                                y_center = min(y_start + (curr_pn // prev_pn) // 2, curr_pn - 1)
+                                x_center = min(x_start + (curr_pn // prev_pn) // 2, curr_pn - 1)
+                                
+                                # 将2D索引扁平化为1D
+                                draft_idx = y_small * prev_pn + x_small
+                                target_idx = y_center * curr_pn + x_center
+                                
+                                # 确保索引在范围内
+                                if target_idx < target_size and draft_idx < draft_size:
+                                    draft_indices.append(draft_idx)
+                                    target_indices.append(target_idx)
+                        
+                        print(f"创建了 {len(draft_indices)} 个从草稿tokens到目标tokens的映射")
                     else:
-                        # 草稿token多于目标token的情况
-                        # 每个目标token验证多个草稿token
+                        # 草稿token多于目标token的情况（罕见）
+                        # 这种情况下可能需要更复杂的映射逻辑
+                        print(f"草稿tokens数量({draft_size})大于目标tokens数量({target_size})，使用线性映射")
+                        
                         for i in range(target_size):
-                            mapping_idx = int(i * draft_size / target_size)
+                            mapping_idx = min(int(i * draft_size / target_size), draft_size - 1)
                             draft_indices.append(mapping_idx)
                             target_indices.append(i)
                     
@@ -1303,25 +1314,23 @@ class SDVAR(nn.Module):
                     
                     # 对每个映射对进行验证
                     for draft_idx, target_idx in zip(draft_indices, target_indices):
-                        if draft_idx < draft_tokens.size(1) and target_idx < target_logits_BlV.size(1):
-                            # 获取该位置的top-k预测
-                            topk_values, topk_indices = torch.topk(target_probs[:, target_idx], k=verification_k, dim=-1)
+                        # 获取该位置的top-k预测
+                        topk_values, topk_indices = torch.topk(target_probs[:, target_idx], k=verification_k, dim=-1)
+                        
+                        # 检查每个batch中的token
+                        for batch_idx in range(B):
+                            draft_token = draft_tokens[batch_idx, draft_idx]
+                            is_in_topk = (topk_indices[batch_idx] == draft_token).any().item()
                             
-                            # 检查该位置的草稿token是否在top-k中
-                            for batch_idx in range(B):
-                                if draft_idx < draft_tokens.size(1):
-                                    draft_token = draft_tokens[batch_idx, draft_idx]
-                                    is_in_topk = (topk_indices[batch_idx] == draft_token).any().item()
-                                    
-                                    if is_in_topk:
-                                        verified_count += 1
-                                        # 在验证位置使用草稿token
-                                        verified_idx_Bl[batch_idx, target_idx] = draft_token
+                            if is_in_topk:
+                                verified_count += 1
+                                # 在验证位置使用草稿token
+                                verified_idx_Bl[batch_idx, target_idx] = draft_token
                     
-                    # 计算总接受率
+                    # 计算总体接受率
                     total_verifications = len(draft_indices) * B
                     acceptance_rate = (verified_count / total_verifications) * 100 if total_verifications > 0 else 0
-                    print(f"映射验证: 接受了 {acceptance_rate:.2f}% 的草稿模型预测")
+                    print(f"空间映射验证: 接受了 {verified_count}/{total_verifications} ({acceptance_rate:.2f}%) 的草稿模型预测")
                 
                 # 使用验证后的索引
                 target_idx_Bl = verified_idx_Bl
