@@ -1232,7 +1232,20 @@ class SDVAR(nn.Module):
                         rng=self.rng
                     ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
                 
-                # 转换形状并处理
+                # 在转换形状前打印维度信息用于调试
+                print(f"draft_h_BChw shape: {draft_h_BChw.shape}, pn: {pn}, target shape: [B={B}, C={self.draft_model.Cvae}, pn={pn}, pn={pn}]")
+
+                # 确保形状匹配
+                expected_size = B * self.draft_model.Cvae * pn * pn
+                actual_size = draft_h_BChw.numel()
+                if actual_size != expected_size:
+                    print(f"维度不匹配! 期望大小: {expected_size}, 实际大小: {actual_size}")
+                    # 临时解决方案：调整pn以匹配实际大小
+                    adjusted_pn = int(math.sqrt(actual_size / (B * self.draft_model.Cvae)))
+                    print(f"调整pn为: {adjusted_pn}")
+                    pn = adjusted_pn
+
+                # 现在使用可能调整过的pn进行转换
                 draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
                 current_f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                     si, total_stages, current_f_hat, draft_h_BChw
